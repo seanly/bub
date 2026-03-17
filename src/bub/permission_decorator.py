@@ -1,3 +1,4 @@
+
 """Permission-aware tool decorator."""
 
 import inspect
@@ -45,10 +46,14 @@ def add_permission_check(tool_instance: Tool) -> Tool:
             kwargs=call_kwargs,
         )
 
-        # 请求权限
-        approved, action = await permission_manager.request_permission(
-            request, prompt_user_cli
-        )
+        # 请求权限（可能抛出 StopRequestException）
+        try:
+            approved, action = await permission_manager.request_permission(
+                request, prompt_user_cli
+            )
+        except BaseException:
+            # 重新抛出所有异常（包括 StopRequestException 和 KeyboardInterrupt）
+            raise
 
         if not approved:
             return f"❌ Permission denied: User rejected {tool_instance.name}"

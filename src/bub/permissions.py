@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 import yaml
+
+
+class StopRequestException(BaseException):
+    """Raised when user wants to stop the current request but keep the conversation.
+
+    Inherits from BaseException (not Exception) to avoid being caught by
+    generic exception handlers in the tool execution chain.
+    """
+    pass
 
 
 class PermissionMode(Enum):
@@ -39,6 +49,7 @@ class PermissionManager:
         self.mode = mode
         self.workspace = workspace
         self.auto_approved_tools: set[str] = set()
+        self._request_stopped = False  # 标记用户是否停止了当前请求
         self.always_ask_tools: set[str] = set()
         self._load_skill_config()
 
@@ -89,6 +100,10 @@ class PermissionManager:
         Returns:
             (approved, action) where action is one of: "approve", "deny", "always", "never"
         """
+        # 如果用户已经停止了请求，直接抛出异常
+        if self._request_stopped:
+            raise StopRequestException("Request already stopped by user")
+
         if self.mode == PermissionMode.AUTO:
             return True, "approve"
 
@@ -102,7 +117,17 @@ class PermissionManager:
                 return True, "approve"
 
         # 询问用户
-        return await prompt_user(request)
+        try:
+            result = await prompt_user(request)
+            return result
+        except StopRequestException:
+            # 用户选择停止，设置标志并重新抛出
+            self._request_stopped = True
+            raise
+
+    def reset_stop_flag(self) -> None:
+        """重置停止标志，用于新的用户请求."""
+        self._request_stopped = False
 
     def _is_safe_tool(self, tool_name: str) -> bool:
         """判断工具是否安全(不需要确认)."""
@@ -120,60 +145,101 @@ class PermissionManager:
 
 async def prompt_user_cli(request: ToolCallRequest) -> tuple[bool, str]:
     """
-    CLI 用户确认界面.
+    CLI 用户确认界面 (使用 Questionary).
 
-    使用 prompt_toolkit 来获取用户输入，兼容 bub 的 CLI 环境。
+    使用 Questionary 提供美观的交互式选择界面。
     """
-    from prompt_toolkit import PromptSession
+    import sys
+    import questionary
+    from questionary import Style
 
     # 构建参数显示
     params_lines = []
+    # 从环境变量读取最大宽度，默认 0（不截断）
+    max_width = int(os.getenv("BUB_LOG_MAX_WIDTH", "0"))
     if request.kwargs:
         for key, value in request.kwargs.items():
-            params_lines.append(f"  {key} = {_format_value(value, max_length=60)}")
+            if max_width > 0:
+                params_lines.append(f"  {key} = {_format_value(value, max_length=max_width)}")
+            else:
+                params_lines.append(f"  {key} = {_format_value(value, max_length=None)}")
 
     params_text = "\n".join(params_lines) if params_lines else "  (no parameters)"
 
-    # 清晰的权限提示
-    print(f"\n{'='*60}")
-    print(f"🔧 Tool Permission Request")
-    print(f"{'='*60}")
+    # 显示权限请求信息
+    print()
+    print("=" * 60)
+    print("🔧 Tool Permission Request")
+    print("=" * 60)
     print(f"Tool: {request.tool_name}")
-    print(f"\nParameters:")
+    print("\nParameters:")
     print(params_text)
-    print(f"\nOptions:")
-    print("  y/yes    → Approve this time")
-    print("  n/no     → Deny this time")
-    print("  always   → Always approve this tool")
-    print("  never    → Always deny this tool")
-    print(f"{'='*60}")
+    print("=" * 60)
+    print()
 
-    # 使用 prompt_toolkit 获取输入
-    session = PromptSession()
+    # 自定义样式
+    custom_style = Style([
+        ('qmark', 'fg:#673ab7 bold'),       # 问号
+        ('question', 'bold'),                # 问题文本
+        ('answer', 'fg:#f44336 bold'),       # 答案
+        ('pointer', 'fg:#673ab7 bold'),      # 指针
+        ('highlighted', 'fg:#673ab7 bold'),  # 高亮选项
+        ('selected', 'fg:#cc5454'),          # 已选择
+        ('separator', 'fg:#cc5454'),         # 分隔符
+        ('instruction', ''),                 # 指令
+        ('text', ''),                        # 普通文本
+    ])
+
     try:
-        response = await session.prompt_async("Your choice: ")
-        response = response.strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("✗ Cancelled\n")
-        return False, "deny"
+        # 使用 Questionary 的 select 创建选择菜单
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: questionary.select(
+                "Do you want to approve this tool call?",
+                choices=[
+                    questionary.Choice("Yes - Approve this time", value="approve"),
+                    questionary.Choice("No - Deny this time", value="deny"),
+                    questionary.Choice("Stop - End current request", value="stop"),
+                ],
+                default="approve",
+                style=custom_style,
+                use_shortcuts=True,
+                use_arrow_keys=True,
+            ).ask()
+        )
 
-    if response in ["y", "yes"]:
-        print("✓ Approved\n")
-        return True, "approve"
-    elif response == "always":
-        print(f"✓ Will always approve '{request.tool_name}'\n")
-        return True, "always"
-    elif response == "never":
-        print(f"✗ Will always deny '{request.tool_name}'\n")
-        return False, "never"
-    else:
-        print("✗ Denied\n")
-        return False, "deny"
+        if result == "approve":
+            print("✓ Approved\n")
+            return True, "approve"
+        elif result == "deny":
+            print("✗ Denied\n")
+            return False, "deny"
+        elif result == "stop":
+            print("\n✗ Request stopped by user\n")
+            # 抛出特殊异常来停止当前请求
+            import sys
+            print(f"DEBUG: Raising StopRequestException", file=sys.stderr)
+            raise StopRequestException("User stopped the current request")
+        else:
+            # 用户取消（Ctrl+C 或 result 为 None）
+            print("\n✗ Cancelled\n")
+            raise KeyboardInterrupt("User cancelled")
+
+    except StopRequestException:
+        # 重新抛出，让上层处理
+        raise
+    except KeyboardInterrupt:
+        # 重新抛出，让上层处理
+        raise
+    except (EOFError, Exception) as e:
+        # 捕获其他异常
+        print(f"\n✗ Cancelled ({type(e).__name__})\n")
+        raise KeyboardInterrupt("Permission prompt failed")
 
 
-def _format_value(value: Any, max_length: int = 100) -> str:
+def _format_value(value: Any, max_length: int | None = 100) -> str:
     """格式化参数值用于显示."""
     s = str(value)
-    if len(s) > max_length:
+    if max_length is not None and max_length > 0 and len(s) > max_length:
         return s[:max_length] + "..."
     return s

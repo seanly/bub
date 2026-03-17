@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
 import shlex
 import time
@@ -76,6 +77,9 @@ class Agent:
             )
             # 为工具添加权限检查
             self._wrap_tools_with_permission()
+        else:
+            # 重置停止标志（新的用户请求）
+            self.permission_manager.reset_stop_flag()
 
         # 将权限管理器和 pause_spinner 回调添加到 context state
         tape.context.state["_permission_manager"] = self.permission_manager
@@ -86,9 +90,19 @@ class Agent:
             await self.tapes.ensure_bootstrap_anchor(tape.name)
             if isinstance(prompt, str) and prompt.strip().startswith(","):
                 return await self._run_command(tape=tape, line=prompt.strip())
-            return await self._agent_loop(
-                tape=tape, prompt=prompt, model=model, allowed_skills=allowed_skills, allowed_tools=allowed_tools
-            )
+
+            try:
+                return await self._agent_loop(
+                    tape=tape, prompt=prompt, model=model, allowed_skills=allowed_skills, allowed_tools=allowed_tools
+                )
+            except BaseException as exc:
+                from bub.permissions import StopRequestException
+                import sys
+                print(f"DEBUG: Caught exception in run(): {type(exc).__name__}: {exc}", file=sys.stderr)
+                if isinstance(exc, StopRequestException):
+                    print(f"DEBUG: Returning stop message", file=sys.stderr)
+                    return "⚠️ Request stopped by user."
+                raise
 
     async def _run_command(self, tape: Tape, *, line: str) -> str:
         line = line[1:].strip()
@@ -102,7 +116,7 @@ class Agent:
         status = "ok"
         try:
             if name not in REGISTRY:
-                output = await REGISTRY["bash"].run(context=context, cmd=line)
+                output = await REGISTRY["exec"].run(context=context, cmd=line)
             else:
                 args = _parse_args(arg_tokens)
                 if REGISTRY[name].context:
@@ -141,6 +155,10 @@ class Agent:
     ) -> str:
         next_prompt: str | list[dict] = prompt
         display_model = model or self.settings.model
+
+        # 检查是否需要自动创建 handoff（避免 context 过长）
+        await self._auto_handoff_if_needed(tape)
+
         for step in range(1, self.settings.max_steps + 1):
             start = time.monotonic()
             logger.info("loop.step step={} tape={} model={}", step, tape.name, display_model)
@@ -153,7 +171,16 @@ class Agent:
                     allowed_skills=allowed_skills,
                     allowed_tools=allowed_tools,
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                # 检查是否是用户停止请求 - 直接重新抛出，不捕获
+                from bub.permissions import StopRequestException
+                if isinstance(exc, StopRequestException):
+                    raise
+
+                # 其他 BaseException（如 KeyboardInterrupt）也重新抛出
+                if not isinstance(exc, Exception):
+                    raise
+
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 await self.tapes.append_event(
                     tape.name,
@@ -198,6 +225,35 @@ class Agent:
                     },
                 )
                 continue
+            # 检查是否是 context 过长的错误
+            if _is_context_overflow_error(outcome.error):
+                logger.warning(f"Context overflow detected, creating handoff: {outcome.error}")
+                try:
+                    info = await self.tapes.info(tape.name)
+                    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+                    await self.tapes.handoff(
+                        tape.name,
+                        name=f"auto-recovery-{timestamp}",
+                        state={"summary": "Auto recovery from context overflow"}
+                    )
+                    await self.tapes.append_event(
+                        tape.name,
+                        "loop.step",
+                        {
+                            "step": step,
+                            "elapsed_ms": elapsed_ms,
+                            "status": "handoff_created",
+                            "error": outcome.error,
+                            "date": datetime.now(UTC).isoformat(),
+                        },
+                    )
+                    # 继续下一个 step，使用新的 context
+                    continue
+                except Exception as e:
+                    logger.error(f"Failed to create handoff: {e}")
+                    # 如果创建 handoff 失败，还是抛出原始错误
+
+            # 其他错误或 handoff 创建失败，抛出异常
             await self.tapes.append_event(
                 tape.name,
                 "loop.step",
@@ -212,6 +268,31 @@ class Agent:
             raise RuntimeError(outcome.error)
 
         raise RuntimeError(f"max_steps_reached={self.settings.max_steps}")
+
+    async def _auto_handoff_if_needed(self, tape: Tape) -> None:
+        """自动创建 handoff 如果 context 太长."""
+        try:
+            info = await self.tapes.info(tape.name)
+
+            # 从环境变量读取阈值，默认 40
+            threshold = int(os.getenv("BUB_AUTO_HANDOFF_THRESHOLD", "40"))
+
+            # 如果自上次锚点以来的条目数超过阈值，创建 handoff
+            if info.entries_since_last_anchor > threshold:
+                logger.info(
+                    "Auto-creating handoff: entries_since_last_anchor={} exceeds threshold={}",
+                    info.entries_since_last_anchor,
+                    threshold
+                )
+                timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+                await self.tapes.handoff(
+                    tape.name,
+                    name=f"auto-checkpoint-{timestamp}",
+                    state={"summary": f"Auto checkpoint after {info.entries_since_last_anchor} entries"}
+                )
+        except Exception as e:
+            # 如果自动 handoff 失败，记录日志但不中断执行
+            logger.warning(f"Auto handoff failed: {e}")
 
     def _load_skills_prompt(self, prompt: str, workspace: Path, allowed_skills: set[str] | None = None) -> str:
         skill_index = {
@@ -272,8 +353,8 @@ class Agent:
         tools_need_permission = [
             "fs.write",
             "fs.edit",
-            "bash",
-            "bash.kill",
+            "exec",
+            "exec.kill",
             "tape.reset",
             "tape.handoff",
         ]
@@ -299,6 +380,22 @@ def _resolve_tool_auto_result(output: ToolAutoResult) -> _ToolAutoOutcome:
         return _ToolAutoOutcome(kind="error", error="tool_auto_error: unknown")
     error_kind = getattr(output.error.kind, "value", str(output.error.kind))
     return _ToolAutoOutcome(kind="error", error=f"{error_kind}: {output.error.message}")
+
+
+def _is_context_overflow_error(error_message: str) -> bool:
+    """检查错误信息是否表示 context 过长."""
+    error_lower = error_message.lower()
+    keywords = [
+        "input length",
+        "context length",
+        "context size",
+        "too long",
+        "exceeds",
+        "maximum",
+        "limit",
+        "range of input",
+    ]
+    return any(keyword in error_lower for keyword in keywords)
 
 
 def _build_llm(settings: AgentSettings, tape_store: AsyncTapeStore) -> LLM:

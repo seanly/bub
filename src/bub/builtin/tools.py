@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from republic import AsyncTapeStore, TapeQuery, ToolContext
 
 from bub.builtin.shell_manager import shell_manager
+from bub.builtin import persistent_shell
 from bub.skills import discover_skills
 from bub.tools import REGISTRY, tool
 
@@ -59,8 +60,8 @@ class SubAgentInput(BaseModel):
     )
 
 
-@tool(context=True)
-async def bash(
+@tool(context=True, name="exec")
+async def exec_command(
     cmd: str,
     cwd: str | None = None,
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
@@ -68,23 +69,30 @@ async def bash(
     *,
     context: ToolContext,
 ) -> str:
-    """Run a shell command. Use background=true to keep it running and fetch output later via bash_output."""
+    """Execute a shell command. Inherits environment variables from the current process. Use background=true for long-running commands."""
     workspace = context.state.get("_runtime_workspace")
     target_cwd = cwd or workspace
-    shell = await shell_manager.start(cmd=cmd, cwd=target_cwd)
+
     if background:
+        # 后台任务使用 shell_manager
+        shell = await shell_manager.start(cmd=cmd, cwd=target_cwd)
         return f"started: {shell.shell_id}"
-    try:
-        async with asyncio.timeout(timeout_seconds):
-            await shell_manager.wait_closed(shell.shell_id)
-    except TimeoutError:
-        await shell_manager.terminate(shell.shell_id)
-        return f"command timed out after {timeout_seconds} seconds and was terminated"
-    return shell.output.strip() or "(no output)"
+
+    # 前台任务：直接执行，继承当前环境变量
+    output, exit_code = await persistent_shell.execute(
+        cmd=cmd,
+        cwd=target_cwd,
+        timeout=float(timeout_seconds)
+    )
+
+    if exit_code != 0:
+        return f"{output}\n(exit code: {exit_code})"
+
+    return output or "(no output)"
 
 
-@tool(name="bash.output")
-async def bash_output(shell_id: str, offset: int = 0, limit: int | None = None) -> str:
+@tool(name="exec.output")
+async def exec_output(shell_id: str, offset: int = 0, limit: int | None = None) -> str:
     """Read buffered output from a background shell, with optional offset/limit for incremental polling."""
     shell = shell_manager.get(shell_id)
     if shell.returncode is not None:
@@ -98,8 +106,8 @@ async def bash_output(shell_id: str, offset: int = 0, limit: int | None = None) 
     return f"id: {shell.shell_id}\nstatus: {shell.status}\nexit_code: {exit_code}\nnext_offset: {end}\noutput:\n{body}"
 
 
-@tool(name="bash.kill")
-async def kill_bash(shell_id: str) -> str:
+@tool(name="exec.kill")
+async def kill_exec(shell_id: str) -> str:
     """Terminate a background shell process."""
     shell = shell_manager.get(shell_id)
     if shell.returncode is None:
@@ -283,10 +291,10 @@ def show_help() -> str:
         "  ,fs.read path=README.md\n"
         "  ,fs.write path=tmp.txt content='hello'\n"
         "  ,fs.edit path=tmp.txt old=hello new=world\n"
-        "  ,bash cmd='sleep 5' background=true\n"
-        "  ,bash_output shell_id=bsh-12345678\n"
-        "  ,kill_bash shell_id=bsh-12345678\n"
-        "Any unknown command after ',' is executed as shell via bash."
+        "  ,exec cmd='sleep 5' background=true\n"
+        "  ,exec.output shell_id=psh-12345678\n"
+        "  ,exec.kill shell_id=psh-12345678\n"
+        "Any unknown command after ',' is executed as shell via exec."
     )
 
 

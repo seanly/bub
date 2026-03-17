@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import replace
@@ -58,7 +59,14 @@ def _render_value(value: Any) -> str:
         rendered = json.dumps(value, ensure_ascii=False)
     except TypeError:
         rendered = repr(value)
-    rendered = _shorten_text(rendered, width=100, placeholder="...")
+
+    # 从环境变量读取最大宽度，默认 0（不截断）
+    # 设置为 0 或负数时不截断（支持方案3）
+    max_width = int(os.getenv("BUB_LOG_MAX_WIDTH", "0"))
+
+    if max_width > 0:
+        rendered = _shorten_text(rendered, width=max_width, placeholder="...")
+
     if rendered.startswith('"') and not rendered.endswith('"'):
         rendered = rendered + '"'
     if rendered.startswith("{") and not rendered.endswith("}"):
