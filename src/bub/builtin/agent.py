@@ -39,6 +39,7 @@ class Agent:
     def __init__(self, framework: BubFramework) -> None:
         self.settings = _load_runtime_settings()
         self.framework = framework
+        self.permission_manager = None  # Will be initialized when needed
 
     @cached_property
     def tapes(self) -> TapeService:
@@ -63,6 +64,23 @@ class Agent:
             return "error: empty prompt"
         tape = self.tapes.session_tape(session_id, workspace_from_state(state))
         tape.context.state.update(state)
+
+        # 初始化权限管理器（如果还没有）
+        if self.permission_manager is None:
+            from bub.permissions import PermissionManager, PermissionMode
+
+            workspace = workspace_from_state(state)
+            self.permission_manager = PermissionManager(
+                mode=PermissionMode.SKILL_BASED,
+                workspace=workspace,
+            )
+            # 为工具添加权限检查
+            self._wrap_tools_with_permission()
+
+        # 将权限管理器和 pause_spinner 回调添加到 context state
+        tape.context.state["_permission_manager"] = self.permission_manager
+        tape.context.state["_pause_spinner"] = state.get("_pause_spinner")
+
         merge_back = not session_id.startswith("temp/")
         async with self.tapes.fork_tape(tape.name, merge_back=merge_back):
             await self.tapes.ensure_bootstrap_anchor(tape.name)
@@ -245,6 +263,24 @@ class Agent:
         if skills_prompt := self._load_skills_prompt(prompt, workspace, allowed_skills):
             blocks.append(skills_prompt)
         return "\n\n".join(blocks)
+
+    def _wrap_tools_with_permission(self) -> None:
+        """为需要权限的工具添加权限检查."""
+        from bub.permission_decorator import add_permission_check
+
+        # 需要权限检查的工具
+        tools_need_permission = [
+            "fs.write",
+            "fs.edit",
+            "bash",
+            "bash.kill",
+            "tape.reset",
+            "tape.handoff",
+        ]
+
+        for tool_name in tools_need_permission:
+            if tool_name in REGISTRY:
+                REGISTRY[tool_name] = add_permission_check(REGISTRY[tool_name])
 
 
 @dataclass(frozen=True)

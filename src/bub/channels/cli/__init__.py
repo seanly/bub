@@ -103,9 +103,9 @@ class CliChannel(Channel):
                 content=request,
                 lifespan=self.message_lifespan(request_completed),
             )
-            with self._renderer.console.status("[cyan]Processing...[/cyan]", spinner="dots"):
-                await self._on_receive(message)
-                await request_completed.wait()
+            # 不使用 spinner，让权限提示可以正常显示
+            await self._on_receive(message)
+            await request_completed.wait()
             request_completed.clear()
 
         self._renderer.info("Bye.")
